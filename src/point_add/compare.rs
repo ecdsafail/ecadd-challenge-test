@@ -17,6 +17,10 @@ use crate::circuit::QubitId;
 /// carry-in wire would have held — so it serves as the first nonlinear control
 /// and no wire is needed either way.
 fn cmp_lt_phase(circ: &mut Builder, u: &[QubitId], v: &[QubitId], borrow_in: Option<QubitId>) {
+    if u.len()==1 || (super::env_flag("PP_COMPACT_COMPARE") && super::optional_env::<usize>("PP_COMPACT_COMPARE_BUDGET")
+        .is_none_or(|budget| circ.active_qubits() as usize + u.len().saturating_sub(1) > budget)) {
+        return cmp_lt_phase_compact(circ, u, v, borrow_in);
+    }
     let n = u.len();
     assert_eq!(v.len(), n);
     // Two bits is the narrowest comparison any caller asks for: the walk's
@@ -75,6 +79,40 @@ fn cmp_lt_phase(circ: &mut Builder, u: &[QubitId], v: &[QubitId], borrow_in: Opt
     circ.free_vec(&carries);
     circ.x_all(u);
 }
+
+/// Exact Cuccaro majority compute / phase / inverse-majority uncompute.
+/// Prefix carries reside in the first operand rather than a separate ladder.
+/// This uses one clean wire (none with a supplied carry), at 2(n-1) Toffoli.
+/// The top majority is needed only as a phase and decomposes into three CZs.
+fn cmp_lt_phase_compact(circ: &mut Builder, u: &[QubitId], v: &[QubitId], borrow_in: Option<QubitId>) {
+    assert_eq!(u.len(), v.len());
+    assert!(!u.is_empty());
+    let first = borrow_in.unwrap_or_else(|| circ.alloc_qubit());
+    circ.x_all(u);
+    for i in 0..u.len()-1 {
+        let previous = if i==0 {first} else {u[i-1]};
+        circ.cx(u[i], v[i]);
+        circ.cx(u[i], previous);
+        circ.ccx(v[i], previous, u[i]);
+    }
+    let last=u.len()-1;
+    let previous=if last==0 {first} else {u[last-1]};
+    circ.cz(u[last], v[last]);
+    circ.cz(u[last], previous);
+    circ.cz(v[last], previous);
+    for i in (0..last).rev() {
+        let previous=if i==0 {first} else {u[i-1]};
+        circ.ccx(v[i], previous, u[i]);
+        circ.cx(u[i], previous);
+        circ.cx(u[i], v[i]);
+    }
+    circ.x_all(u);
+    if borrow_in.is_none() {circ.free(first);}
+}
+
+#[cfg(test)]
+#[path = "compact_compare_tests.rs"]
+mod compact_tests;
 
 /// Measured-erasure repair, the pattern behind every truncated comparison in
 /// the circuit.

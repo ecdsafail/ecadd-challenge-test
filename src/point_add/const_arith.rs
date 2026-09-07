@@ -211,6 +211,9 @@ pub fn cadd_const_trunc(
     ctrl: QubitId,
     first_carry_is_zero: bool,
 ) {
+    if acc.len() >= 16 && super::env_flag("PP_BLOCKED_FOLD") {
+        return super::pingpong::blocked_constant(circ, acc, c, ctrl);
+    }
     let n = acc.len();
     assert!(n >= 2, "the ladder needs at least two positions");
     let last = n - 2;

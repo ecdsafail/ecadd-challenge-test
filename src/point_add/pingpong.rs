@@ -57,6 +57,13 @@ use super::{fold_guard, pinned_env, required_env, Builder, N, SECP256K1_P};
 use crate::circuit::{BitId, QubitId};
 use alloy_primitives::U256;
 
+#[path = "blocked_fold.rs"]
+mod blocked_fold;
+
+pub(super) fn blocked_constant(circ: &mut Builder, acc: &[QubitId], c: U256, ctrl: QubitId) {
+    blocked_fold::constant(circ, acc, c, ctrl, super::optional_env("PP_FOLD_BLOCK").unwrap_or(8));
+}
+
 /// Signed envelope the walk values live in: 256 magnitude bits plus room for
 /// the sign and the round-0 lift.
 const VALUE_WIDTH: usize = N + 3;
@@ -1749,6 +1756,9 @@ fn chunk_layout(n: usize, target: usize) -> Option<Vec<(usize, usize)>> {
 /// wires — appears in it, so none of them can drift out of a model.
 fn chunked_add(circ: &mut Builder, addend: &[QubitId], acc: &[QubitId], round: usize) -> QubitId {
     let ladder = walk_max_qubits().saturating_sub(circ.active_qubits() as usize);
+    if super::env_flag("PP_COMPACT_ADD") && ladder < replay_chunk_compare()+3 {
+        return super::modular::compact_add(circ, addend, acc);
+    }
     let bounds = chunk_layout(addend.len(), ladder).expect("a chunk layout fits the ladder target");
 
     let mut carry_in: Option<QubitId> = None;
@@ -1827,6 +1837,10 @@ fn fold_selected(
     minus_f: QubitId,
     first_carry: QubitId,
 ) {
+    if super::env_flag("PP_BLOCKED_FOLD") {
+        return blocked_fold::selected(circ, acc, f, plus_f, plus_2f, minus_f,
+            first_carry, super::optional_env("PP_FOLD_BLOCK").unwrap_or(8));
+    }
     let width = acc.len();
     let negative_f = twos_complement_bits(f, width);
     let selectors = |i: usize| {

@@ -72,6 +72,10 @@ pub fn ripple_add(
     } else {
         width.saturating_sub(2)
     };
+    if super::env_flag("PP_COMPACT_ADD") && super::optional_env::<usize>("PP_COMPACT_COMPARE_BUDGET")
+        .is_some_and(|budget| circ.active_qubits() as usize + owned > budget) {
+        return compact_add_with(circ, addend, acc, carry_in, carry_out);
+    }
     let mut carries = circ.alloc_qubits(owned);
     carries.extend(carry_out);
     let previous = |i: usize| {
@@ -105,6 +109,44 @@ pub fn ripple_add(
         unwind_carry_step(circ, addend[i], acc[i], previous(i), carries[i]);
     }
 }
+
+/// Exact low-space adder with a returned carry: Cuccaro MAJ/UMA, 2n Toffoli,
+/// one clean workspace wire plus the caller-owned output carry. Both the
+/// addend and incoming zero are restored, with no measured boundary repairs.
+pub fn compact_add(circ: &mut Builder, addend: &[QubitId], acc: &[QubitId]) -> QubitId {
+    let out=circ.alloc_qubit();
+    compact_add_with(circ, addend, acc, None, Some(out));
+    out
+}
+
+pub fn compact_add_with(circ: &mut Builder, addend: &[QubitId], acc: &[QubitId],
+                        carry_in: Option<QubitId>, carry_out: Option<QubitId>) {
+    assert_eq!(addend.len(), acc.len());
+    assert!(!acc.is_empty());
+    let zero=carry_in.unwrap_or_else(||circ.alloc_qubit());
+    let steps=acc.len()-usize::from(carry_out.is_none());
+    for i in 0..steps {
+        let previous=if i==0 {zero} else {addend[i-1]};
+        circ.cx(addend[i], acc[i]);
+        circ.cx(addend[i], previous);
+        circ.ccx(acc[i], previous, addend[i]);
+    }
+    if let Some(out)=carry_out {circ.cx(addend[acc.len()-1], out);} else {
+        circ.cx(addend[acc.len()-1], acc[acc.len()-1]);
+        circ.cx(if steps==0 {zero} else {addend[steps-1]}, acc[acc.len()-1]);
+    }
+    for i in (0..steps).rev() {
+        let previous=if i==0 {zero} else {addend[i-1]};
+        circ.ccx(acc[i], previous, addend[i]);
+        circ.cx(addend[i], previous);
+        circ.cx(previous, acc[i]);
+    }
+    if carry_in.is_none() {circ.free(zero);}
+}
+
+#[cfg(test)]
+#[path = "compact_add_tests.rs"]
+mod compact_tests;
 
 /// One ripple stage: `carry = MAJ(addend, acc, previous)`, with the incoming
 /// carry folded into the operands and back out again. A `None` `previous` is a
