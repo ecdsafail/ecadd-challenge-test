@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use alloy_primitives::U256;
 
-use crate::circuit::{BitId, Op, OperationType, QubitId};
+use crate::circuit::{BitId, Op, QubitId};
 use builder::Builder;
 use classical::{coord_add3x, coord_rsub, coord_sub};
 use pingpong::{divide, multiply};
@@ -162,28 +162,6 @@ fn optional_env<T: FromStr>(name: &str) -> Option<T> {
 // is where the two values have to be read side by side to stay one bit apart.
 pinned_env!(fold_guard, "FOLD_GUARD");
 
-/// Rewrite the 96-op identity tail to encode the ground nonce. Only `q_target`
-/// changes (X;X pairs stay identities), so circuit function is untouched; the
-/// Fiat-Shamir seed is what moves.
-fn apply_tail_nonce(mut ops: Vec<Op>, nonce: u64) -> Vec<Op> {
-    let n = ops.len();
-    assert!(n >= 96, "op stream too short for nonce tail");
-    let start = n - 96;
-    for i in 0..96 {
-        assert!(
-            ops[start + i].kind == OperationType::X,
-            "tail op {} is not an X",
-            start + i
-        );
-    }
-    for b in 0..48 {
-        let t = QubitId((nonce >> b) & 1);
-        ops[start + 2 * b].q_target = t;
-        ops[start + 2 * b + 1].q_target = t;
-    }
-    ops
-}
-
 /// The candidate itself: `(x, y) += (ox, oy)` on secp256k1 in affine
 /// coordinates, with `(ox, oy)` classical.
 ///
@@ -230,173 +208,147 @@ fn build_point_add() -> Vec<Op> {
     circ.take_ops()
 }
 
-/// Pin every tuning knob, build the circuit, and bake the ground nonce into its
-/// tail.
+/// Pin every tuning knob and build the circuit.
 ///
 /// These pins are the circuit's entire configuration. Everything under
 /// [`build_point_add`] reads them back through [`required_env`], which panics on
 /// a missing one, so a dropped pin stops the build instead of quietly emitting a
 /// different circuit. [`set_default_env`] does not overwrite, so a value already
-/// in the environment wins -- that is how the knobs are swept, and why
-/// `src/bin/grind` recovers the tuning by reading these lines as text rather
-/// than by trusting the environment it happens to run in.
+/// in the environment wins -- that is how the knobs are swept.
 ///
-/// Grouped by what each value shapes, with the measurement that fixed it.
+/// # Why these values differ from the inherited ones
+///
+/// This configuration is chosen so the circuit is CORRECT for a random
+/// Fiat-Shamir draw, not for one ground op stream. The inherited pins (696
+/// rounds, a width schedule fitted to the typical magnitude rather than to an
+/// envelope of it, and 20/21-bit measured-erasure compares) leave an expected
+/// ~18 wrong shots per 9,024-shot run: they only pass because the tail nonce was
+/// ground against their exact op stream. Measured directly -- the inherited
+/// circuit was re-run under 24 arbitrary tail nonces and failed all 24, with 12
+/// to 25 classical mismatches and 8 to 20 phase-garbage batches each.
+///
+/// There is no tail nonce here at all. The 96-op identity tail and the
+/// `TAIL_NONCE` knob that steered it have been removed, so nothing in this tree
+/// can select a favourable shot sample.
+///
+/// Every width below is set from a measured error budget. The total expected
+/// number of wrong shots per 9,024-shot run is about 0.044, i.e. a per-input
+/// error rate near 5e-6, and the dominant terms are the two walks' convergence
+/// tails and the width schedule's margin. Measured: 31 of 31 independent
+/// Fiat-Shamir draws pass with zero mismatches and zero phase garbage, which
+/// bounds the rate at 0.093 with 95% confidence. See
+/// research/claude-run/REPORT.md for the model and the measurements.
 pub fn build() -> Vec<Op> {
     // ── The two walks ──────────────────────────────────────────────────────
 
-    // Per-round register width for the divide's walk, run-length encoded as
-    // `width x rounds` (a bare `width` is a run of one). Its LENGTH is that
-    // walk's round count, so there is no separate rounds knob on this side.
-    // Run-length rather than 696 loose integers because the schedule is a
-    // staircase -- every width from 259 down to 8 appears as exactly one run --
-    // so it is the form an edit is least likely to corrupt, and a third the
-    // size. GENERATED, by fitting each round's width to the measured magnitude
-    // distribution of the recurrence, and WRONG for any other depth: to change
-    // the depth, regenerate rather than truncate or pad. See
-    // `pingpong::width_schedule`.
+    // Per-round walk register width, run-length encoded as `width x rounds`.
+    // Its LENGTH is the divide walk's round count, so there is no separate
+    // rounds knob on this side.
+    //
+    // GENERATED, and generated differently from the inherited schedule. Every
+    // entry is an upper bound on the width the recurrence actually needs at that
+    // round, taken from a direct measurement of the recurrence rather than from a
+    // single fitted margin, and non-increasing so `shrink_to` can apply it.
+    //
+    // Why the shape and not just the level: the width the recurrence needs is
+    // near-deterministic in the early rounds and has a long thin tail in the
+    // late ones. A schedule that is a fixed number of bits below the worst case
+    // is therefore too narrow at the head and too generous at the tail. Too
+    // narrow at the head is not a rare miss: `shrink_to` frees a wire that is
+    // not a sign copy, `Builder::free`'s reset leaks a random phase, and the run
+    // fails. That is what the inherited configuration's phase-garbage batches
+    // were.
+    //
+    // One trap worth writing down: make the schedule non-increasing with a
+    // suffix maximum, never by clamping a round down to its predecessor. Round 1
+    // is pinned to 257 by `round1_forward`'s assert while round 2 needs 258, so
+    // the downward clamp silently puts round 2 below its requirement and fails
+    // about 30% of shots.
+    //
+    // 730 rounds, not 696. The walk must reach |u| = |v| = 1 before `endpoint`
+    // is valid, and 696 rounds leaves about 4 shots in every 9,024 short of that
+    // on their own. 730 takes it to about 0.012. Do not truncate or pad this
+    // literal; its length IS the divide depth, and a different depth needs a
+    // schedule generated for that depth.
     set_default_env(
         "PP_WIDTH_SCHEDULE",
         concat!(
-            "259,258x19,257x5,256x3,255x4,254x4,253x2,252x4,251x3,250x5,249x2,248x4,",
-            "247x3,246x2,245x4,244x3,243x3,242x3,241x3,240x3,239x4,238x3,237x2,236x4,",
-            "235x2,234x3,233x2,232x4,231x4,230x2,229x3,228x3,227x3,226x2,225x4,224x2,",
-            "223x2,222x3,221x3,220x4,219x3,218x2,217x3,216x3,215x3,214x4,213x2,212x2,",
-            "211x3,210x4,209x3,208x2,207x2,206x2,205x3,204x2,203x4,202x3,201x3,200x4,",
-            "199x2,198x2,197x3,196x2,195x2,194x4,193x4,192x2,191x3,190x3,189x2,188x3,",
-            "187x2,186x3,185x2,184x3,183x4,182x2,181x3,180x4,179x2,178x2,177x3,176x3,",
-            "175,174x2,173x2,172x4,171x3,170x2,169x2,168x4,167x3,166x3,165x2,164x3,",
-            "163x3,162x2,161x3,160x2,159x3,158x2,157x3,156x2,155x4,154x2,153x3,152x2,",
-            "151x3,150x3,149x2,148x2,147x2,146x4,145x4,144x3,143x2,142x2,141x3,140x2,",
-            "139x2,138x2,137x3,136x2,135x4,134x3,133x3,132x3,131x2,130x3,129x2,128x4,",
-            "127x3,126x2,125x2,124x3,123x2,122x3,121x3,120x2,119x5,118x2,117x3,116x2,",
-            "115x3,114x4,113x2,112x2,111x4,110x2,109x2,108x2,107x2,106x2,105x5,104x2,",
-            "103x2,102x2,101x2,100x4,99x2,98x2,97x2,96x3,95x3,94x3,93x2,92x3,91x2,",
-            "90x4,89x3,88x2,87x2,86x4,85x2,84,83x4,82x2,81x2,80x2,79x3,78x2,77x2,76x3,",
-            "75,74x2,73x3,72x3,71x2,70x3,69x3,68x3,67x3,66x2,65x3,64x4,63x2,62x2,61x3,",
-            "60x2,59x2,58x2,57x2,56x2,55x3,54x3,53x2,52x3,51x2,50x4,49x2,48x2,47x3,",
-            "46x3,45x2,44x2,43x3,42x2,41x2,40x3,39x2,38x2,37x3,36x4,35x2,34x3,33x2,",
-            "32x2,31x2,30x2,29x2,28x4,27x2,26x2,25x3,24x2,23x2,22x2,21x3,20x3,19x2,",
-            "18x3,17x2,16x2,15x3,14x2,13x2,12x2,11x2,10x2,9x4,8x9",
+            "259,258x23,257x4,256x4,255x4,254x5,253x2,252x3,251x6,250x3,249x6,248x2,247x2,246x4,245x2,",
+            "244x4,243x3,242x2,241x3,240x3,239x3,238x5,237x3,236x3,235x5,234,233x3,232x4,231x3,230x3,",
+            "229x3,228x3,227x2,226x2,225x4,224x6,223x3,222x3,221x2,220x5,219x2,218x4,217,216x3,215x2,",
+            "214x4,213x3,212x3,211x4,210x2,209x4,208x3,207,206x2,205x4,204x3,203x2,202x3,201x4,200x4,",
+            "199x2,198x4,197x2,196x3,195x6,194x2,193,192,191x3,190,189x6,188x3,187,186x4,185x3,184,",
+            "183x3,182x3,181x2,180x3,179x3,178x3,177x4,176x2,175x2,174x2,173x2,172x3,171x3,170x6,",
+            "169x2,168,167x2,166x2,165x4,164x2,163x6,162x2,161x3,160x4,159x2,158x5,157x2,156x2,155x2,",
+            "154x4,153x3,152x3,151x6,150x2,149x2,148x2,147x2,146x3,145,144x4,143,142x4,141x2,140x3,",
+            "139x3,138x4,137x2,136x2,135x2,134x2,133x3,132x5,131,130x3,129x3,128x2,127x2,126x5,125x3,",
+            "124x2,123x2,122x3,121x2,120x2,119x6,118x2,117,116x2,115,114x4,113x2,112x4,111x3,110x3,",
+            "109x2,108x4,107x3,106,105x3,104x3,103x2,102x2,101x3,100x4,99x2,98x2,97x4,96x2,95x4,94x2,",
+            "93x3,92x2,91x4,90x2,89x2,88x2,87x2,86x7,85,84x3,83x4,82x2,81,80x2,79x3,78x2,77x3,76x2,",
+            "75x5,74,73x4,72x4,71x3,70x3,69x2,68x4,67x2,66x2,65x2,64,63x5,62x2,61x3,60x2,59x3,58x4,",
+            "57x4,56,55x4,54x2,53x3,52x3,51x3,50x2,49x2,48,47x5,46x2,45x2,44x2,43x2,42x2,41x3,40x4,",
+            "39x3,38x4,37,36,35x3,34x2,33x2,32x3,31x5,30x3,29x2,28,27x4,26x6,25,24,23,22,21x2,20x3,",
+            "19x3,18x4,17x4,16x3,15,14x3,13x4,12,11x3,10x3,9,8x2,7x2",
         ),
     );
-    // The multiply walk's round count. The divide's is the schedule's length
-    // above; only this side needs a number of its own. 695 is the cheapest
-    // lambda in the tree to buy, and funding it by narrowing the fold profile
-    // was measured and does not pay.
-    set_default_env("PP_ROUNDS_MUL", "694");
-    // The peak, and therefore half the score. Nothing else sets it: the walk's
-    // split adds and the replay's chunked adds both size themselves against this
-    // and land on it exactly. The replay folds used to floor it as well -- the
-    // divide's trailing batch at `1210 + window` -- but the fold profile below
-    // narrows those rounds to 49 and 50.
-    //
-    // Not free: the narrower ladder needs 64 more approximate chunk boundaries,
-    // ~0.06 lambda, for -0.033% of score. That is 0.56% per lambda, five times
-    // the rate anything else in the tree trades at, which is why it is taken --
-    // but it is still lambda, and lambda is paid in the cost of grinding a nonce.
-    set_default_env("PP_WALK_MAX_QUBITS", "1260");
+    // The multiply walk's round count. Its denominator is as uniformly
+    // distributed as the divide's, so it needs the same depth; the inherited
+    // two-round discount was paid for out of the same failure budget.
+    set_default_env("PP_ROUNDS_MUL", "730");
+    // The peak, and therefore half the score. Both carry-ladder sites size
+    // themselves against this, so the achieved peak is exactly this value as
+    // long as it is at or above the rigid floor. That floor is
+    // 512 (numerator + coefficient) + 727 (tape) + 61 (fold ladder) + 8, i.e.
+    // 1308, measured with PEAK_CENSUS. Setting the cap below it buys no qubits
+    // and costs Toffoli: at 1298 the same build reports 1308 and spends 7,400
+    // more gates.
+    set_default_env("PP_WALK_MAX_QUBITS", "1308");
 
     // ── The replay fold window ─────────────────────────────────────────────
 
-    // The base truncation window each replay cell folds at, per direction.
-    set_default_env("PP_REPLAY_FOLD_WINDOW", "53");
-    // The multiply's is one bit wider, and that bit is a deliberate purchase in
-    // the opposite direction to the cap above: it pays 688 executed Toffoli
-    // (0.076% of score, and the peak does NOT move -- 1260 holds, it is 55 that
-    // breaks to 1261) to buy back 1.13 +/- 0.31 lambda, measured paired at a
-    // fixed `EVAL_SEED` over 600,000 shots a side. Nothing in the tree sells
-    // lambda at that rate, so this is not an arbitrage; it is bought because the
-    // binding constraint was grinding a nonce rather than the score. The
-    // divide's window stays at 53 because it holds about half the lambda the
-    // multiply's does, so the same bit buys proportionally less.
-    set_default_env("PP_REPLAY_FOLD_WINDOW_MUL", "54");
-    // Per-round offsets on those two windows, as `width:offset` bands keyed on
-    // the walk's width at that round. MEASURED, not derived: the rate at which
-    // the fold's dropped carry actually matters is flat for the first 85% of the
-    // walk and then collapses ~11x over the last hundred rounds. Keyed on the
-    // width rather than the round so that regenerating the schedule above
-    // carries the profile with it; `pingpong::fold_offset` applies it.
-    set_default_env("PP_FOLD_PROFILE", "38:0,32:-1,19:-3,0:-4");
-    // How many leading rounds carry one extra bit of window. The level, kept
-    // deliberately out of the shape above: the measured rate is flat across
-    // exactly the region this covers, so one threshold reads it more honestly
-    // than another band would.
-    set_default_env("PP_FOLD_WIDEN", "242");
-    // Where the trailing replay batch takes over. Everything above it is
-    // replayed at the terminal state, where `loan_terminal` has collapsed both
-    // walk registers to a sign wire and the tape is at its longest -- so the
-    // widest fold in that batch is the widest thing alive anywhere, and the peak
-    // floors at `1210 + window` for the batch's first round. Everything in
-    // `r1..=r2` is instead replayed beside its own walk round, where the walk
-    // register is still live and there is correspondingly less room.
-    //
-    // The emitted count does not move at all across this range -- 945,183 scored
-    // gates at every value from 630 to 656 -- so the choice is purely about the
-    // peak, and the peak gives a plateau with a hard edge at each end. MEASURED:
-    //
-    //   <= 614   the plan assertion fires
-    //   615..630 peak 1262
-    //   631..655 peak 1260   <- pinned mid-plateau
-    //   656..657 peak 1261
-    //   >= 658   peak 1262
-    //
-    // The lower edge is exactly derivable and worth understanding, because it
-    // moves whenever the schedule or the fold profile does. The fold window is
-    // keyed on the walk's width, and in round space this schedule crosses the
-    // profile's bands at 616 (width < 38, offset -1) and 632 (width < 32, offset
-    // -3). A trailing batch starting in 616..631 therefore folds at window 52 and
-    // floors the peak at 1262; from 632 the window is 50 and the floor is 1260.
-    // So the batch must not start before 632, i.e. `r2 >= 631` -- which is the
-    // measured edge to the round.
-    //
-    // The upper edge is the mirror: it is where the last interleaved fold stops
-    // fitting beside its live walk register. That is a footprint prediction of
-    // the same kind `head_boundary` makes for `r1`, not a closed form.
-    //
-    // Note the plan's own assertion is much weaker than the real constraint: it
-    // only requires the batch not to reach past `fold_ramp_start` (616), i.e.
-    // `r2 >= 615`, so 615..630 passes it and quietly costs two qubits.
-    set_default_env("PP_R2", "648");
+    // The truncation window each replay cell folds its modular correction at.
+    // The correction is +/-f or +2f with f = 2^32 + 977, so a carry escapes the
+    // window with probability about 2^(33-window); calibrated against measured
+    // failure counts at windows 45 and 50 the constant is 3.3e16 * 2^-window
+    // expected wrong shots per run, giving 0.0036 at the effective 63.
+    // The base is 64 and the profile below takes one bit back, which is how the
+    // effective 63 is expressed while keeping `fold_ramp_start` at round 0 --
+    // that is what frees `PP_R2` to place a trailing batch at all.
+    set_default_env("PP_REPLAY_FOLD_WINDOW", "64");
+    set_default_env("PP_REPLAY_FOLD_WINDOW_MUL", "64");
+    // Flat. The inherited profile narrowed the late rounds against a measured
+    // rate that only holds once the walk has converged, which is exactly the
+    // case this configuration stops assuming.
+    set_default_env("PP_FOLD_PROFILE", "0:-1");
+    set_default_env("PP_FOLD_WIDEN", "0");
+    // Where the trailing replay batch takes over. This is worth 25 qubits: the
+    // rounds in the batch are replayed at the terminal state, where
+    // `loan_terminal` has collapsed both walk registers, instead of beside a
+    // live walk register. Measured across 600..730 the peak is flat at 1308
+    // from 600 to 620 and rises past it.
+    set_default_env("PP_R2", "620");
 
     // ── The two phase-channel compares ─────────────────────────────────────
     //
-    // Both repair an approximation whose error appears as a PHASE rather than as
-    // a wrong bit, so no classical model of the values can see either one. Each
-    // is a base width plus a per-round band table, narrowing where the walk
-    // narrows for the same reason the fold window does and by the same kind of
-    // measurement.
-
-    // Chunk-boundary repair. `chunk_layout` reads this flat base, so narrowing
-    // the comparison does not move the boundaries themselves.
-    set_default_env("PP_REPLAY_CHUNK_COMPARE", "21");
-    set_default_env("PP_CHUNK_SHAPE", "38:0,25:-2,0:-4");
-    // The replay cell's overflow flag, same construction.
-    set_default_env("PP_REPLAY_FLAG_COMPARE", "20");
-    set_default_env("PP_FLAG_SHAPE", "38:0,25:-2,0:-4");
+    // Both repair a measured-out carry by recomputing `a < b` over the top k
+    // bits, so each is wrong with probability about 2^-k per call and the error
+    // appears as leftover phase. Their Toffoli sit under a `push_condition` on
+    // the measurement outcome and so execute on about half the shots, which is
+    // why they are the cheapest place in the tree to buy correctness: about 700
+    // executed Toffoli per bit against the fold window's 1,480.
+    set_default_env("PP_REPLAY_CHUNK_COMPARE", "34");
+    set_default_env("PP_CHUNK_SHAPE", "0:0");
+    set_default_env("PP_REPLAY_FLAG_COMPARE", "33");
+    set_default_env("PP_FLAG_SHAPE", "0:0");
 
     // ── The two widths every approximation outside the replay reads ────────
     //
-    // 21 and 22 are the balance point against the replay folds' 289 executed
-    // Toffoli per lambda. The compare is one bit finer because its gates sit
-    // under a `push_condition` and so execute half the time, which halves what a
-    // bit of width costs there; the derivation is above `fold_guard`.
-    set_default_env("FOLD_GUARD", "21");
-    set_default_env("ERASE_COMPARE", "22");
+    // These govern about fifty truncated constant folds per shot in the
+    // coordinate shell and the square, all of which run far below the peak, so
+    // widening them costs about 68 Toffoli per bit and no qubits at all. The
+    // inherited 21/22 left 0.007 expected wrong shots on the table for nothing.
+    set_default_env("FOLD_GUARD", "32");
+    set_default_env("ERASE_COMPARE", "32");
 
-    // ── The ground nonce ───────────────────────────────────────────────────
-    //
-    // Ground against this exact op stream, which is what selects the 9,024
-    // graded shots: ANY change to the emitted ops re-rolls them and voids this
-    // value. `md5sum ops.bin` is the acceptance test for a refactor here.
-    set_default_env("TAIL_NONCE", "2977985437");
-
-    let mut ops = build_point_add();
-    let nonce: u64 = required_env("TAIL_NONCE");
-    let mut x = Op::empty();
-    x.kind = OperationType::X;
-    x.q_target = QubitId(0);
-    ops.extend(std::iter::repeat_n(x, 96));
-    ops = apply_tail_nonce(ops, nonce);
-    ops
+    build_point_add()
 }
