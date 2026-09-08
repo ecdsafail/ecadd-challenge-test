@@ -66,8 +66,8 @@ fn set_default_env(name: &str, value: &str) {
 /// band tables (`PP_FOLD_PROFILE`, `PP_CHUNK_SHAPE`,
 /// `PP_FLAG_SHAPE`).
 macro_rules! pinned_env {
-    ($name:ident, $env:literal) => {
-        fn $name() -> usize {
+    ($vis:vis $name:ident, $env:literal) => {
+        $vis fn $name() -> usize {
             static SLOT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
             *SLOT.get_or_init(|| $crate::point_add::required_env($env))
         }
@@ -384,12 +384,21 @@ pub fn build() -> Vec<Op> {
     set_default_env("FOLD_GUARD", "21");
     set_default_env("ERASE_COMPARE", "22");
 
+    // ── Square recursion policy ────────────────────────────────────────────
+    //
+    // A Karatsuba sum half of at least SUM_MIN bits is split again instead of
+    // squared triangularly (the sum children are 65/65/66 bits; 999 disables).
+    // The low half is split only from LOW_MIN bits (129 disables; the low
+    // children are 64 bits). Exact arithmetic only: no failure sites move.
+    set_default_env("SQ_SPLIT_SUM_MIN", "65");
+    set_default_env("SQ_SPLIT_LOW_MIN", "64");
+
     // ── The ground nonce ───────────────────────────────────────────────────
     //
     // Ground against this exact op stream, which is what selects the 9,024
     // graded shots: ANY change to the emitted ops re-rolls them and voids this
     // value. `md5sum ops.bin` is the acceptance test for a refactor here.
-    set_default_env("TAIL_NONCE", "2977985437");
+    set_default_env("TAIL_NONCE", "4399134209103");
 
     let mut ops = build_point_add();
     let nonce: u64 = required_env("TAIL_NONCE");

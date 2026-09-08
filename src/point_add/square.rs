@@ -16,7 +16,7 @@
 //! complement-add-complement subtraction.
 
 use super::modular::{add_wide, addsub_full, addsub_wide, mod_addsub, sub_wide};
-use super::{fold_guard, Builder, N};
+use super::{fold_guard, pinned_env, Builder, N};
 use crate::circuit::QubitId;
 
 /// `f = 2^256 - p` in non-adjacent form: the value is `sum (-1)^neg * 2^shift`,
@@ -183,16 +183,58 @@ fn fold_times_f(circ: &mut Builder, negate: bool, product: &[QubitId], out: &[Qu
     }
 }
 
-/// Scratch held from a forward split to its matching inverse: `t = a + b`, and
-/// a register that holds `t^2` at both ends and `2ab` in between.
-type K2Retained = (Vec<QubitId>, Vec<QubitId>);
+/// Scratch held from a forward split to its matching inverse.
+///
+/// The sum `t = a + b` is not a register of its own: it lives in the input's
+/// high half `b` plus this one borrowed carry wire, exactly as the top-level
+/// [`sub_square`] does with the caller's `y_hi`. `b` is restored in the inverse
+/// before `b^2` is cleared. `cross` holds `t^2` at both ends and `2ab` in
+/// between. `low` / `sum` carry the retained scratch of a child split when a
+/// half was itself split rather than squared directly.
+struct K2Retained {
+    carry: QubitId,
+    cross: Vec<QubitId>,
+    low: Option<Box<K2Retained>>,
+    sum: Option<Box<K2Retained>>,
+}
+
+/// Recursion policy: a sum half of at least this many bits is split again
+/// instead of squared triangularly. `B(m) = m(m-1)/2 + 4m - 3` for the base
+/// case against `K(m) = B(a) + B(b) + B(b+1) + a + 7b + 1` for one split puts
+/// the break-even near 60 bits; the tree-wide peak, not the count, is what
+/// bounds how deep this may go, so it is a pinned knob rather than a constant.
+pinned_env!(sq_split_sum_min, "SQ_SPLIT_SUM_MIN");
+/// Same policy for the low half `a`, whose split leaves `a` itself modified
+/// until the inverse -- so `a` must be consumed (into `t = a + b`) before its
+/// split is built. Disabled by pinning it above any half width (>= 129).
+pinned_env!(sq_split_low_min, "SQ_SPLIT_LOW_MIN");
+
+fn square_half(circ: &mut Builder, x: &[QubitId], product: &[QubitId], min: usize) -> Option<Box<K2Retained>> {
+    if x.len() >= min {
+        Some(Box::new(tri_square_k2r(circ, x, product)))
+    } else {
+        tri_square(circ, x, product, false);
+        None
+    }
+}
+
+fn square_half_inv(circ: &mut Builder, x: &[QubitId], product: &[QubitId], retained: Option<Box<K2Retained>>) {
+    match retained {
+        Some(r) => tri_square_k2r_inv(circ, x, product, *r),
+        None => tri_square(circ, x, product, true),
+    }
+}
 
 /// Triangular square of `x` into the materialised `product` via the in-place
-/// Karatsuba split: `a^2` and `b^2` are built by `tri_square` directly into the
-/// two DISJOINT halves of the zeroed product register, and the cross term
-/// `2ab = t^2 - a^2 - b^2` is built in the returned scratch and rippled in at
-/// shift `lo` with one full-width exact add. That scratch stays live across the
-/// consumer's folds, so the inverse never recomputes a sub-square.
+/// Karatsuba split: `a^2` and `b^2` are built into the two DISJOINT halves of
+/// the zeroed product register, and the cross term `2ab = t^2 - a^2 - b^2` is
+/// built in the returned scratch and rippled in at shift `lo` with one
+/// full-width exact add. That scratch stays live across the consumer's folds,
+/// so the inverse never recomputes a sub-square.
+///
+/// Order matters for the in-place sum: `b^2` is built from the pristine `b`,
+/// then `b` becomes `t = a + b` (with the pristine `a`), and only then may `a`
+/// be split -- a split leaves its input modified until the inverse.
 ///
 /// Every primitive here is an exact full-width add or subtract, so this adds no
 /// truncated comparison, windowed fold or measured chunk boundary — the
@@ -203,24 +245,27 @@ fn tri_square_k2r(circ: &mut Builder, x: &[QubitId], product: &[QubitId]) -> K2R
     let lo = m / 2;
     let (a, bs) = x.split_at(lo);
     let (a2, b2) = product.split_at(2 * lo);
-    // a^2 and b^2 straight into the disjoint halves of the zeroed product.
-    tri_square(circ, a, a2, false);
+    // b^2 straight into the high half of the zeroed product, from the pristine b.
     tri_square(circ, bs, b2, false);
-    // t = a + b, one bit wider than b.
-    let t = circ.alloc_qubits(bs.len() + 1);
-    circ.cx_pairs(a, &t[..lo]);
-    add_wide(circ, bs, &t);
-    // p_t = t^2, then subtract the still-pure halves to leave 2ab. Both
+    // t = a + b, in place: b's own wires plus one carry.
+    let carry = circ.alloc_qubit();
+    let mut t = bs.to_vec();
+    t.push(carry);
+    add_wide(circ, a, &t);
+    // a^2 into the low half; a may now be split since nothing reads it again
+    // before the inverse.
+    let low = square_half(circ, a, a2, sq_split_low_min());
+    // cross = t^2, then subtract the still-pure halves to leave 2ab. Both
     // intermediates are nonnegative (t^2 - a^2 = 2ab + b^2 >= 0), so the
     // two's-complement frame never wraps at this width.
-    let p_t = circ.alloc_qubits(2 * t.len());
-    tri_square(circ, &t, &p_t, false);
-    sub_wide(circ, a2, &p_t);
-    sub_wide(circ, b2, &p_t);
+    let cross = circ.alloc_qubits(2 * t.len());
+    let sum = square_half(circ, &t, &cross, sq_split_sum_min());
+    sub_wide(circ, a2, &cross);
+    sub_wide(circ, b2, &cross);
     // product += 2ab << lo, exact full ripple to the top (x^2 < 2^(2m), so the
     // top never overflows).
-    add_wide(circ, &p_t, &product[lo..]);
-    (t, p_t)
+    add_wide(circ, &cross, &product[lo..]);
+    K2Retained { carry, cross, low, sum }
 }
 
 /// Inverse of `tri_square_k2r`, consuming its retained scratch. Requires
@@ -233,24 +278,26 @@ fn tri_square_k2r_inv(
 ) {
     let m = x.len();
     assert_eq!(product.len(), 2 * m);
-    let (t, p_t) = retained;
+    let K2Retained { carry, cross, low, sum } = retained;
     let lo = m / 2;
     let (a, bs) = x.split_at(lo);
     let (a2, b2) = product.split_at(2 * lo);
+    let mut t = bs.to_vec();
+    t.push(carry);
     // product -= 2ab << lo: the halves are pure a^2 / b^2 again.
-    sub_wide(circ, &p_t, &product[lo..]);
-    // p_t: 2ab -> t^2, then clear it with the inverse triangular square.
-    add_wide(circ, b2, &p_t);
-    add_wide(circ, a2, &p_t);
-    tri_square(circ, &t, &p_t, true);
-    circ.free_vec(&p_t);
-    // Uncompute t = a + b.
-    sub_wide(circ, bs, &t);
-    circ.cx_pairs(a, &t[..lo]);
-    circ.free_vec(&t);
-    // Clear the pure halves.
+    sub_wide(circ, &cross, &product[lo..]);
+    // cross: 2ab -> t^2, then clear it with the inverse square (which also
+    // restores t if its own split modified it).
+    add_wide(circ, b2, &cross);
+    add_wide(circ, a2, &cross);
+    square_half_inv(circ, &t, &cross, sum);
+    circ.free_vec(&cross);
+    // Clear a^2, restoring a first if it was split, then uncompute t = a + b:
+    // t - a = b < 2^|b|, so the carry wire returns to |0>.
+    square_half_inv(circ, a, a2, low);
+    sub_wide(circ, a, &t);
+    circ.free(carry);
     tri_square(circ, bs, b2, true);
-    tri_square(circ, a, a2, true);
 }
 
 /// Materialise `x^2` in a fresh register, run `folds` against it, then uncompute

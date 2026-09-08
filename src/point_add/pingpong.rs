@@ -94,7 +94,7 @@ pinned_env!(replay_flag_compare, "PP_REPLAY_FLAG_COMPARE");
 // a modelled live set instead gives the same layout at every call: such a model
 // is high by exactly `MODEL_OVERCOUNT`, so its budget is only ever this knob plus
 // four, and its achieved peak this knob exactly.
-pinned_env!(walk_max_qubits, "PP_WALK_MAX_QUBITS");
+pinned_env!(pub(super) walk_max_qubits, "PP_WALK_MAX_QUBITS");
 
 /// Wires a footprint *model* counts that the allocator has already taken back:
 /// the two tape signs [`free_sign_bit`] measures out early, and the walk's

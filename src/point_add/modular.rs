@@ -2,6 +2,7 @@ use alloy_primitives::U256;
 
 use super::compare::erase_with_compare;
 use super::const_arith::cadd_const_trunc;
+use super::pingpong::walk_max_qubits;
 use super::{fold_guard, pinned_env, Builder, SECP256K1_P};
 use crate::circuit::QubitId;
 
@@ -58,8 +59,9 @@ pub fn ripple_add(
     carry_in: Option<QubitId>,
     carry_out: Option<QubitId>,
 ) {
-    let width = addend.len();
-    assert_eq!(width, acc.len(), "ripple_add: width mismatch");
+    let width = acc.len();
+    let k = addend.len();
+    assert!(k >= 1 && k <= width, "ripple_add: addend must be 1..=acc bits wide");
     if width == 0 {
         return;
     }
@@ -81,9 +83,17 @@ pub fn ripple_add(
             Some(carries[i - 1])
         }
     };
+    // A position at or above `k` has no addend bit: its stage is the same
+    // ladder step with the addend fixed at zero, `carry = acc AND previous`,
+    // and it always has a previous carry because `k >= 1`.
+    let zero_prev = |i: usize| previous(i).expect("a zero-addend position always has a carry in");
 
     for i in 0..carries.len() {
-        carry_step(circ, addend[i], acc[i], previous(i), carries[i]);
+        if i < k {
+            carry_step(circ, addend[i], acc[i], previous(i), carries[i]);
+        } else {
+            circ.ccx(zero_prev(i), acc[i], carries[i]);
+        }
     }
 
     if vented || width == 1 {
@@ -93,17 +103,34 @@ pub fn ripple_add(
         // applied. A width-1 wrapped add is all top and no ladder.
         let top = width - 1;
         if let Some(previous) = previous(top) {
-            let into = if vented { addend[top] } else { acc[top] };
+            let into = if vented && top < k { addend[top] } else { acc[top] };
             circ.cx(previous, into);
         }
-        circ.cx(addend[top], acc[top]);
+        if top < k {
+            circ.cx(addend[top], acc[top]);
+        }
     } else {
         terminal_step(circ, addend, acc, previous(width - 2));
     }
 
     for i in (0..owned).rev() {
-        unwind_carry_step(circ, addend[i], acc[i], previous(i), carries[i]);
+        if i < k {
+            unwind_carry_step(circ, addend[i], acc[i], previous(i), carries[i]);
+        } else {
+            unwind_zero_step(circ, acc[i], zero_prev(i), carries[i]);
+        }
     }
+}
+
+/// Undo a zero-addend stage: erase `carry = acc AND previous` in the X basis,
+/// repair its phase from the two wires that produced it, and apply the sum bit.
+fn unwind_zero_step(circ: &mut Builder, acc: QubitId, previous: QubitId, carry: QubitId) {
+    let measured = circ.alloc_bit();
+    circ.hmr(carry, measured);
+    circ.cz_if(previous, acc, measured);
+    circ.free_bit(measured);
+    circ.free(carry);
+    circ.cx(previous, acc);
 }
 
 /// One ripple stage: `carry = MAJ(addend, acc, previous)`, with the incoming
@@ -162,8 +189,17 @@ fn terminal_step(
     acc: &[QubitId],
     previous: Option<QubitId>,
 ) {
-    let n = addend.len();
+    let n = acc.len();
+    let k = addend.len();
     let i = n - 2;
+    if i >= k {
+        // Zero-addend stage below a zero-addend top: `acc_top ^= acc_i AND
+        // previous`, then the sum bit `acc_i ^= previous`.
+        let previous = previous.expect("a zero-addend position always has a carry in");
+        circ.ccx(previous, acc[i], acc[n - 1]);
+        circ.cx(previous, acc[i]);
+        return;
+    }
     if let Some(previous) = previous {
         circ.cx(previous, addend[i]);
         circ.cx(previous, acc[i]);
@@ -172,7 +208,9 @@ fn terminal_step(
     if let Some(previous) = previous {
         circ.cx(previous, acc[n - 1]);
     }
-    circ.cx(addend[n - 1], acc[n - 1]);
+    if n - 1 < k {
+        circ.cx(addend[n - 1], acc[n - 1]);
+    }
     if let Some(previous) = previous {
         circ.cx(previous, addend[i]);
     }
@@ -214,14 +252,14 @@ pub fn addsub_full(circ: &mut Builder, addend: &[QubitId], acc: &[QubitId], inve
     }
 }
 
-/// Same, for a `value` narrower than `acc`: zero-extend it with throwaway pads
-/// for the duration of the ripple.
+/// Same, for a `value` narrower than `acc`: the positions above the value are
+/// zero-addend stages of the one ladder (`carry = acc AND previous`), so this
+/// costs the same `acc.len() - 1` Toffoli a zero-extended full ripple does but
+/// keeps no pad qubits live -- the pads used to be what let the square's
+/// cross-term add set the peak.
 pub fn addsub_wide(circ: &mut Builder, value: &[QubitId], acc: &[QubitId], inverse: bool) {
-    let pads = circ.alloc_qubits(acc.len() - value.len());
-    let mut wide = value.to_vec();
-    wide.extend_from_slice(&pads);
-    addsub_full(circ, &wide, acc, inverse);
-    circ.free_vec(&pads);
+    assert!(value.len() <= acc.len(), "addsub_wide: value wider than acc");
+    addsub_full(circ, value, acc, inverse);
 }
 
 pub fn add_wide(circ: &mut Builder, value: &[QubitId], acc: &[QubitId]) {
@@ -230,6 +268,40 @@ pub fn add_wide(circ: &mut Builder, value: &[QubitId], acc: &[QubitId]) {
 
 pub fn sub_wide(circ: &mut Builder, value: &[QubitId], acc: &[QubitId]) {
     addsub_wide(circ, value, acc, true);
+}
+
+/// `ripple_add` with a carry-out, whose carry ladder is made to fit under the
+/// tree-wide peak ([`walk_max_qubits`]) when the plain ladder would not.
+///
+/// The plain ripple keeps `width - 1` carries plus the overflow live at once.
+/// When that overshoots the peak, the add is cut into an exact leading chunk
+/// and the rest: the leading chunk ripples into a carry wire `mid`, unwinds its
+/// own carries, the high chunk ripples on from `mid` to `carry_out`, and `mid`
+/// is then erased by comparing the WHOLE leading chunk (`sum < addend`, exact
+/// because chunk 0 has no carry-in -- the same lambda-free repair
+/// `pingpong::chunk_layout` gives its leading chunk). Cost: one Toffoli per
+/// leading-chunk bit under a half-time condition; no new failure site. The
+/// leading chunk is the narrowest that fits, so the plain add is emitted
+/// unchanged wherever it already fits -- the coordinate shell is byte-identical.
+fn peak_fitted_add(circ: &mut Builder, value: &[QubitId], acc: &[QubitId], carry_out: QubitId) {
+    let width = value.len();
+    let room = walk_max_qubits().saturating_sub(circ.active_qubits() as usize);
+    // Plain ladder: `width - 1` owned carries (the overflow is already counted
+    // in the live set).
+    if width < 3 || room >= width - 1 {
+        ripple_add(circ, value, acc, None, Some(carry_out));
+        return;
+    }
+    // Split: the high chunk of `high` bits owns `high - 1` carries with `mid`
+    // live beside them, so `high <= room`. The leading chunk needs >= 2 bits
+    // for the comparison.
+    let high = room.clamp(1, width - 2);
+    let low = width - high;
+    let mid = circ.alloc_qubit();
+    ripple_add(circ, &value[..low], &acc[..low], None, Some(mid));
+    ripple_add(circ, &value[low..], &acc[low..], Some(mid), Some(carry_out));
+    erase_with_compare(circ, mid, &acc[..low], &value[..low], None);
+    circ.free(mid);
 }
 
 /// `acc += value (mod p)`, or `acc -= value` when `negate`.
@@ -245,7 +317,7 @@ pub fn mod_addsub(circ: &mut Builder, negate: bool, value: &[QubitId], acc: &[Qu
         circ.x_all(acc);
     }
     let overflow = circ.alloc_qubit();
-    ripple_add(circ, value, acc, None, Some(overflow));
+    peak_fitted_add(circ, value, acc, overflow);
     add_f_window(circ, overflow, acc, f_slice(), false);
     let cmp_bits = erase_compare();
     let (top_acc, top_value) = (
